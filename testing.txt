@@ -1,2 +1,7 @@
 http://localhost/dvwa/vulnerabilities/sqli/
 
+>>>19/03/25
+We built a SQLi scanner with Tkinter GUI, crawler, payload generator,
+ detection logic, and reporting. The latest issue was a PDF generation 
+ error which we fixed. Now the user wants to improve the accuracy of vulnerability classification.
+ >>>
