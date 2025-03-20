@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 import threading
 import sys
+import re
 import traceback
 # Add these imports at the top
 from fpdf import FPDF
@@ -77,8 +78,35 @@ def start_scan_threaded():
 
 
 
+class ResponseAnalyzer:
+    def __init__(self):
+        self.baselines = {}
+    
+    def create_baseline(self, response):
+        self.baselines['default'] = {
+            'length': len(response.text),
+            'fingerprint': self._create_fingerprint(response.text)
+        }
+    
+    def _create_fingerprint(self, text):
+        return {
+            'tag_count': len(BeautifulSoup(text, 'html.parser').find_all()),
+            'text_ratio': len(text) / (len(re.sub(r'\s+', '', text)) + 1)
+        }
+    
+    def is_different(self, response):
+        baseline = self.baselines.get('default')
+        if not baseline:
+            return True
+        test_len = len(response.text)
+        test_fp = self._create_fingerprint(response.text)
+        return (abs(test_len - baseline['length']) > 100 or 
+                test_fp['tag_count'] != baseline['fingerprint']['tag_count'])
+
+
 class SQLiTester:
     def __init__(self, target_url):
+        self.response_comparator = ResponseAnalyzer()
         self.session = requests.Session()
         self.vulnerabilities = []
         self.target_url = target_url
@@ -187,6 +215,12 @@ class SQLiTester:
                 elif name in inputs_list:
                     base_data[name] = '1'  # Safe value
                     debug_log(f"Found input field: {name}")
+            
+            
+            # ✅ Create baseline before any boolean testing
+            baseline_response = self.session.get(form_url)
+            self.response_comparator.create_baseline(baseline_response)
+            
     
             # Test all payload types
             for payload_type in PAYLOADS:
@@ -247,12 +281,15 @@ class SQLiTester:
                             else:
                                 response = self.session.post(form_url, data=test_data, timeout=15)
                                 
-                            if self.is_vulnerable(response, payload_type):
+                            vuln_type, dbms = self.is_vulnerable(response, payload_type)
+                            if vuln_type:
+                                debug_log(f"!!! {vuln_type.upper()} VULNERABILITY ({dbms})")
                                 self.vulnerabilities.append({
                                     'url': form_url,
                                     'payload': payload,
-                                    'type': payload_type,
-                                    'confidence': 'High' if payload_type == 'error_based' else 'Medium'
+                                    'type': vuln_type,
+                                    'dbms': dbms,
+                                    'confidence': self.calculate_confidence(vuln_type, dbms)
                                 })
                                 return True
                                 
@@ -284,82 +321,86 @@ class SQLiTester:
 
             # Detection criteria
             vuln_detected = False
-            if "First name" in response_text:
-                # Count number of users shown
-                user_count = response_text.count("First name")
-                if user_count > 1:
-                    debug_log(f"Found {user_count} users - vulnerability confirmed")
-                    vuln_detected = True
+            vuln_type = None
+            dbms = 'MySQL'  # DVWA uses MySQL by default
 
+            # Check for specific vulnerability indicators
             if "SQL syntax" in response_text:
                 debug_log("Found SQL error message")
+                vuln_type = 'error_based'
                 vuln_detected = True
-
-            if len(response_text) - len(baseline_text) > 100:
+            elif "First name" in response_text:
+                user_count = response_text.count("First name")
+                if user_count > 1:
+                    debug_log(f"Found {user_count} users - boolean bypass confirmed")
+                    vuln_type = 'boolean'
+                    vuln_detected = True
+            elif len(response_text) - len(baseline_text) > 100:
                 debug_log("Significant content difference detected")
+                vuln_type = 'boolean'
                 vuln_detected = True
 
-            # In test_dvwa_sqli_form()
             if vuln_detected:
-                vuln_type = 'boolean'  # or 'union'/'error' based on actual criteria
-                debug_log(f"!!! VULNERABILITY FOUND: {vuln_type}")
+                confidence = self.calculate_confidence(vuln_type, dbms)
                 self.vulnerabilities.append({
-                    'url': form_url,
-                    'payload': test_data['id'],
-                    'type': vuln_type,  # Dynamic typing
-                    'confidence': 'High'
-                })
+                'url': form_url,
+                'payload': test_data['id'],
+                'type': vuln_type,
+                'dbms': dbms,
+                'confidence': f"{confidence}%"  # Add % symbol
+            })
+                return True  # Return True when vulnerable
 
             return False
         except Exception as e:
             debug_log(f"DVWA test error: {str(e)}")
             return False
+
+
             
     def is_vulnerable(self, response, payload_type):
-        try:
-            content = response.text.lower()
-            headers = str(response.headers).lower()
+        content = response.text.lower()
+        headers = str(response.headers).lower()
 
-            # Error-based detection
-            if payload_type == 'error_based':
-                error_patterns = {
-                    'mysql': r"sql syntax.*mysql|warning.*mysql",
-                    'mssql': r"unclosed quotation|microsoft ole db provider",
-                    'postgresql': r"pg_exec|postgresql"
-                }
-                for db, pattern in error_patterns.items():
-                    if re.search(pattern, content, re.DOTALL):
-                        debug_log(f"Detected {db} error")
-                        return True
-                return False
+        # Error-based detection
+        if payload_type == 'error_based':
+            error_patterns = {
+                'mysql': r"sql syntax.*mysql|warning.*mysql",
+                'mssql': r"unclosed quotation|microsoft ole db provider",
+                'postgresql': r"pg_exec|postgresql"
+            }
+            for db, pattern in error_patterns.items():
+                if re.search(pattern, content, re.DOTALL):
+                    return ('error_based', db)  # Return type + DBMS
 
-            # Time-based detection    
-            elif payload_type == 'time_based':
-                return response.elapsed.total_seconds() > 4
+        # Time-based detection
+        elif payload_type == 'time_based':
+            return ('time_based', 'generic') if response.elapsed.total_seconds() > 4 else None
 
-            # Union-based detection
-            elif payload_type == 'union':
-                union_indicators = [
-                    'version()',  # PostgreSQL
-                    '@@version',  # MySQL/MSSQL
-                    'microsoft sql server',
-                    'mysql_fetch_array()',
-                    'pg_catalog'
-                ]
-                return any(indicator in content for indicator in union_indicators)
+        # Union-based detection  
+        elif payload_type == 'union':
+            if any(x in content for x in ['version()', '@@version', 'pg_catalog']):
+                return ('union', self.detect_dbms(response))
 
-            # Boolean-based detection
-            elif payload_type == 'boolean':
-                return any(marker in content for marker in [
-                    'welcome back', 'login success', 
-                    'user exists', 'admin panel'
-                ])
+        # Boolean-based detection
+        elif payload_type == 'boolean':
+            if self.response_comparator.is_different(response):
+                return ('boolean', 'generic')
 
-            return False
-        except Exception as e:
-            debug_log(f"Vulnerability check error: {str(e)}")
-            return False
+        return (None, None)
 
+    
+    def detect_dbms(self, response):
+        content = response.text.lower()
+        if 'mysql' in content:
+            return 'MySQL'
+        elif 'microsoft ole db' in content:
+            return 'MSSQL'
+        elif 'postgresql' in content:
+            return 'PostgreSQL'
+        return 'Unknown'
+
+    
     def detect_columns(self, form_url, method):
         """Determine number of columns using ORDER BY"""
         debug_log("Detecting column count...")
@@ -369,6 +410,18 @@ class SQLiTester:
             if "Unknown column" in response.text:
                 return i-1
         return 0
+    
+    
+    def calculate_confidence(self, vuln_type, dbms):
+        confidence_map = {
+            'error_based': {'MySQL': 95, 'MSSQL': 90, 'PostgreSQL': 85},
+            'time_based': {'MySQL': 80, 'MSSQL': 75, 'PostgreSQL': 70, 'generic': 70},
+            'union': {'MySQL': 90, 'MSSQL': 85, 'PostgreSQL': 80},
+            'boolean': {'MySQL': 85, 'MSSQL': 80, 'PostgreSQL': 75, 'generic': 75}  # Added DBMS-specific
+        }
+        return confidence_map.get(vuln_type, {}).get(dbms, 70)
+    
+    
     
     
 def crawl_forms(url, session):
@@ -472,43 +525,45 @@ def generate_report():
     if not hasattr(generate_report, 'tester') or not generate_report.tester.vulnerabilities:
         messagebox.showinfo("Info", "No vulnerabilities to report")
         return
-    
+
     vulnerabilities = generate_report.tester.vulnerabilities
     filename = f"SQLi_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
-    
+
     try:
         pdf = FPDF()  # Initialize FIRST
         pdf.add_page()
         pdf.set_font("Arial", size=12)
-        
+
         # Header
         pdf.cell(200, 10, txt="SQL Injection Scan Report", ln=1, align='C')
         pdf.cell(200, 10, txt=f"Scanned URL: {url_entry.get()}", ln=1)
         pdf.cell(200, 10, txt=f"Scan Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=1)
         pdf.ln(10)
-        
+
         # Vulnerabilities
         pdf.set_fill_color(200, 220, 255)
         pdf.cell(200, 10, txt=f"Found {len(vulnerabilities)} vulnerabilities:", ln=1, fill=True)
-        
+
         for idx, vuln in enumerate(vulnerabilities, 1):
             pdf.multi_cell(0, 10, txt=f"""
             Vulnerability #{idx}
             URL: {vuln['url']}
-            Type: {vuln['type'].title()}
+            Type: {vuln['type'].title()} ({vuln['dbms']})
             Payload: {vuln['payload']}
             Confidence: {vuln['confidence']}
             """, border=1)
             pdf.ln(3)
-        
+
+
         pdf.output(filename)
         messagebox.showinfo("Success", f"Report saved as {filename}")
-        
+
     except Exception as e:
         error_msg = f"Failed to generate report: {str(e)}"
         if 'pdf' in locals():  # Only if PDF was partially created
             error_msg += f"\nPartial file: {filename}"
         messagebox.showerror("Error", error_msg)
+
 
 # GUI Setup
 root = tk.Tk()
